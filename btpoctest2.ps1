@@ -1,61 +1,50 @@
 <#
 .SYNOPSIS
-    Audit system and user PATH variables for insecure (writable) directories.
-    Targeted for Privilege Escalation (PrivEsc) analysis.
+    Deep Audit for Granular WD/AD Permissions in PATH.
+    Targets exactly what icacls revealed: WD (WriteData) and AD (AppendData).
 #>
 
-# Define high-risk identity groups to check for
 $RiskGroups = @("Everyone", "Users", "Authenticated Users", "BUILTIN\Users")
 
-# Define write-related permissions
-$WritePermissions = @("Write", "Modify", "FullControl", "WriteData", "CreateFiles")
+# Low-level flags that equate to "I can drop an EXE here"
+$GranularFlags = @(
+    [System.Security.AccessControl.FileSystemRights]::WriteData,
+    [System.Text.RegularExpressions.Regex]::Escape("WriteData"),
+    "CreateFiles",
+    "AppendData"
+)
 
-Write-Host "[*] Beginning Machine-wide PATH Hijack Audit..." -ForegroundColor Cyan
-Write-Host "----------------------------------------------------"
-
-# 1. Collect all unique paths from System and User environments
 $RawPath = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH", "User")
-$AllPaths = $RawPath -split ";" | Where-Object { $_ -ne "" } | Select-Object -Unique
+$AllPaths = $RawPath -split ";" | Where-Object { $_ -match "[a-zA-Z]:\\" } | Select-Object -Unique
 
-$VulnerablePaths = @()
+Write-Host "[*] Auditing for Granular Write (WD/AD) Rights..." -ForegroundColor Cyan
 
-# 2. Iterate and analyze each directory
-foreach ($Path in $AllPaths) {
-    if (!(Test-Path $Path)) {
-        Write-Host "[!] Path does not exist but is in PATH: $Path" -ForegroundColor Yellow
-        continue
-    }
+foreach ($Dir in $AllPaths) {
+    $Dir = $Dir.Trim()
+    if (!(Test-Path $Dir)) { continue }
 
     try {
-        $ACL = Get-Acl -Path $Path
-        $AccessRules = $ACL.Access | Where-Object { $_.IdentityReference -in $RiskGroups }
-
-        foreach ($Rule in $AccessRules) {
-            # Check if any of the permissions match our 'Write' list
-            foreach ($Perm in $WritePermissions) {
-                if ($Rule.FileSystemRights.ToString() -match $Perm) {
-                    Write-Host "[!] VULNERABLE: $Path" -ForegroundColor Red
-                    Write-Host "    - Group: $($Rule.IdentityReference)"
-                    Write-Host "    - Rights: $($Rule.FileSystemRights)"
-                    
-                    $VulnerablePaths += [PSCustomObject]@{
-                        Path   = $Path
-                        Group  = $Rule.IdentityReference
-                        Rights = $Rule.FileSystemRights
+        $Acl = Get-Acl -Path $Dir
+        foreach ($Access in $Acl.Access) {
+            $Identity = $Access.IdentityReference.Value
+            
+            # Check if the identity is in our risk group
+            if ($RiskGroups -contains $Identity -or $Identity -match "Users$|Everyone$") {
+                
+                $Rights = $Access.FileSystemRights.ToString()
+                
+                # Check for the specific WD/AD flags you found with icacls
+                foreach ($Flag in $GranularFlags) {
+                    if ($Rights -match $Flag) {
+                        Write-Host "[!] HIJACKABLE: $Dir" -ForegroundColor Red
+                        Write-Host "    - Identity: $Identity"
+                        Write-Host "    - Granular Rights: $Rights"
+                        break
                     }
-                    break 
                 }
             }
         }
     } catch {
-        Write-Host "[-] Access Denied checking ACL for: $Path" -ForegroundColor Gray
+        Write-Host "[-] Access Denied: $Dir" -ForegroundColor Gray
     }
-}
-
-# 3. Summary Report
-Write-Host "`n----------------------------------------------------"
-if ($VulnerablePaths.Count -gt 0) {
-    Write-Host "[+] Found $($VulnerablePaths.Count) potential hijack points." -ForegroundColor Red
-} else {
-    Write-Host "[+] No insecure PATH directories identified." -ForegroundColor Green
 }
